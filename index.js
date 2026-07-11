@@ -6,9 +6,17 @@ const fs = require('fs');
 const { PassThrough } = require('stream');
 const os = require('os');
 
+// Increase the process listener limit. Puppeteer registers process-level
+// exit/SIGINT/SIGTERM/SIGHUP listeners on every browser launch and does not
+// always clean them up on close. This silences the noisy
+// MaxListenersExceededWarning so real problems are easier to see in the logs.
+// The restart counter/logging below is what actually tells us if restarts
+// are happening too often.
+process.setMaxListeners(50);
+
 const app = express();
 
-const VERSION = '2.0'; // version 2.0 logging
+const VERSION = '2.1'; // version 2.1 - backpressure + restart logging
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
 const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
@@ -66,7 +74,19 @@ let page = null;
 let captureInterval = null;
 let isStreamReady = false;
 
+// --- New state for backpressure + overlap protection + restart diagnostics ---
+let isCapturing = false;      // prevents overlapping screenshot calls
+let canWrite = true;          // false when ffmpegStream's internal buffer is full
+let browserRestartCount = 0;  // how many times we've had to relaunch the browser
+let framesWritten = 0;
+let framesSkippedBackpressure = 0;
+let framesSkippedOverlap = 0;
+
 const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function logTS(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
 
 // Helper: Fisher–Yates shuffle
 function shuffleArray(array) {
@@ -149,7 +169,9 @@ function generateXMLTV(host) {
   return xml;
 }
 
-async function startBrowser() {
+async function startBrowser(reason = 'initial startup') {
+  browserRestartCount++;
+  logTS(`Launching browser (launch #${browserRestartCount}, reason: ${reason})`);
   if(browser) await browser.close().catch(()=>{});
   browser = await puppeteer.launch({
     headless: true,
@@ -223,12 +245,25 @@ async function startBrowser() {
 		}
   }
   await page.setViewport({ ...VIEW_DIMENSIONS });
+
+  // Reset capture guards after a fresh browser/page is ready.
+  isCapturing = false;
+  canWrite = true;
+  logTS(`Browser ready (launch #${browserRestartCount})`);
 }
 
 async function startTranscoding() {
-  await startBrowser();
+  await startBrowser('initial startup');
   createAudioInputFile();
-  ffmpegStream = new PassThrough();
+
+  // Give the PassThrough a modest, explicit buffer size. This is what makes
+  // backpressure kick in quickly rather than silently buffering an
+  // ever-growing backlog of frames in memory.
+  ffmpegStream = new PassThrough({ highWaterMark: 1024 * 1024 * 4 }); // ~4MB
+  ffmpegStream.on('drain', () => {
+    canWrite = true;
+  });
+
   ffmpegProc = ffmpeg()
     .input(ffmpegStream)
     .inputFormat('image2pipe')
@@ -238,24 +273,54 @@ async function startTranscoding() {
     .complexFilter([`[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`,'[1:a]volume=0.5[a]'])
     .outputOptions(['-map [v]','-map [a]','-c:v libx264','-c:a aac','-b:a 128k','-preset ultrafast','-b:v 1000k','-f hls','-hls_time 2','-hls_list_size 2','-hls_flags delete_segments'])
     .output(HLS_FILE)
-    .on('start',()=>{ console.log(`Started FFmpeg - Version ${VERSION}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
-    .on('error', async err=>{ console.error('FFmpeg error:',err); await stopTranscoding(); startTranscoding(); })
+    .on('start',()=>{ logTS(`Started FFmpeg - Version ${VERSION}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
+    .on('error', async err=>{ logTS(`FFmpeg error: ${err.message}`); await stopTranscoding(); startTranscoding(); })
     .on('end',()=>{ ffmpegProc=null; ffmpegStream=null; isStreamReady=false; });
 
   captureInterval = setInterval(async ()=>{
     if(!ffmpegProc || !ffmpegStream || !page) return;
+
+    // Don't start a new screenshot if the previous one hasn't finished yet.
+    // Overlapping screenshot calls were likely a big contributor to the
+    // browser hangs/restarts (and the "11 listeners" leak in the logs).
+    if (isCapturing) {
+      framesSkippedOverlap++;
+      return;
+    }
+
+    // Don't capture new frames if ffmpeg can't keep up. Without this, frames
+    // pile up in memory forever and playback drags further and further
+    // behind wall-clock time (the "racing clock" issue) instead of staying
+    // roughly live.
+    if (!canWrite) {
+      framesSkippedBackpressure++;
+      return;
+    }
+
+    isCapturing = true;
     try{
-      if(page.isClosed()){ await startBrowser(); return; }
+      if(page.isClosed()){ isCapturing = false; await startBrowser('page was closed'); return; }
       // Updated 16:9 capture for version 1.6
       const screenshot = await page.screenshot({
         type:'png',
         clip:{ x:0, y:0, ...VIEW_DIMENSIONS } // crop top, right, and bottom based on your measurements
       });
-      ffmpegStream.write(screenshot);
+      const ok = ffmpegStream.write(screenshot);
+      framesWritten++;
+      if (!ok) canWrite = false; // wait for 'drain' before writing again
+
+      // Every 5 minutes, log a quick health summary. Useful for confirming
+      // whether backpressure/overlap skips are happening in practice.
+      if (framesWritten % (FRAME_RATE * 60 * 5) === 0) {
+        logTS(`Health check: framesWritten=${framesWritten}, skippedBackpressure=${framesSkippedBackpressure}, skippedOverlap=${framesSkippedOverlap}, browserRestarts=${browserRestartCount}`);
+      }
     } catch(err){
       console.warn('Capture error, retrying...', err.message);
-      await startBrowser();
+      isCapturing = false;
+      await startBrowser(`capture error: ${err.message}`);
+      return;
     }
+    isCapturing = false;
   },1000/FRAME_RATE);
 
   ffmpegProc.run();
@@ -283,7 +348,15 @@ app.get('/guide.xml',(req,res)=>{
   res.set('Content-Type','application/xml'); res.send(generateXMLTV(host));
 });
 
-app.get('/health',(req,res)=>{ res.status(isStreamReady?200:503).json({ready:isStreamReady}); });
+app.get('/health',(req,res)=>{
+  res.status(isStreamReady?200:503).json({
+    ready:isStreamReady,
+    browserRestarts: browserRestartCount,
+    framesWritten,
+    framesSkippedBackpressure,
+    framesSkippedOverlap
+  });
+});
 
 const { cpus, memoryMB } = getContainerLimits();
 console.log(`Version ${VERSION} | Running with ${cpus} CPU cores, ${memoryMB}MB RAM`);

@@ -1,5 +1,10 @@
 # Latest Update
 
+07/11/2026 version2.1  Added attempt to fix rare stream being more than 3 minutes behind and racing catchup.  Added better logging to troubleshoot this issue.http://<host>:9798/health
+
+05/04/2026
+Added PR from netbymatt changing from jpeg to png.
+
 05/03/2026
 Added PR from ws4kp's netbymatt in anticipation of ws4kp versions 7.X and addition of PERMALINK_URL: Pass configuration parameters via permalink generated from ws4kp.  As usual I did not have time to test the update so please report any issues.
 
@@ -21,14 +26,11 @@ docker run -d \
   ghcr.io/netbymatt/ws4kp:latest
 ```
 
-***Please note that this variable goes in the WS4KP container not this ws4channels container.****
 
-
-Use the :latest tag for these changes.
 
 
 # Known Bugs
-
+Rare cases of the stream getting 30+ minutes behind and racing to catch up after stream is played long term.
 
 # ws4channels
 
@@ -64,6 +66,7 @@ docker run -d \
   --memory="1096m" \
   --cpus="1.0" \
   -p 9798:9798 \
+  -e PERMALINK_URL=your_permalink_generated_from_ws4kp \
   -e ZIP_CODE=your_zip_code \
   -e WS4KP_HOST=ws4kp_host \
   -e WS4KP_PORT=ws4kp_port \
@@ -74,9 +77,11 @@ Example:
 
  --memory="1096m" --cpus="1.0" -p 9798:9798 -e ZIP_CODE=63101 -e WS4KP_PORT=8080 -e WS4KP_HOST=192.168.1.152
 
--1096m=the amount of maximum ram the container can use in mb
+-1096m=the amount of maximum ram the container can use in mb. 
 
 -1.0= maximum amount of cpu cores the container can use. Default is 1 core
+
+-PERMALINK_URL=  Add if you created a permalink within ws4kp, delete this variable if not.
 
 -63101= enter your zip code
 
