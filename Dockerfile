@@ -18,6 +18,9 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --chown=node:node . .
 
+RUN mkdir -p /app/output /app/music /app/logo && \
+    chown -R node:node /app
+
 USER node
 
 EXPOSE 9798
