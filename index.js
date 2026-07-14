@@ -174,7 +174,7 @@ async function startBrowser(reason = 'initial startup') {
   logTS(`Launching browser (launch #${browserRestartCount}, reason: ${reason})`);
   if(browser) await browser.close().catch(()=>{});
   browser = await puppeteer.launch({
-    headless: true,
+    headless: "new",
     args:['--no-sandbox','--disable-setuid-sandbox','--disable-infobars','--ignore-certificate-errors','--window-size=1280,720'],
     defaultViewport: null
   });
