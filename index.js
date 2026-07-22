@@ -5,14 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const { PassThrough } = require('stream');
 const os = require('os');
-
-// Increase the process listener limit. Puppeteer registers process-level
-// exit/SIGINT/SIGTERM/SIGHUP listeners on every browser launch and does not
-// always clean them up on close. This silences the noisy
-// MaxListenersExceededWarning so real problems are easier to see in the logs.
-// The restart counter/logging below is what actually tells us if restarts
-// are happening too often.
-process.setMaxListeners(50);
+const { SingleFlight } = require('./lib/single-flight');
 
 const app = express();
 
@@ -25,6 +18,7 @@ const WS4KP_URL = `http://${WS4KP_HOST}:${WS4KP_PORT}`;
 const PERMALINK_URL = process.env.PERMALINK_URL || null;
 const HLS_SETUP_DELAY = 2000;
 const FRAME_RATE = process.env.FRAME_RATE || 10;
+const BROWSER_RESTART_DELAY_MS = Number(process.env.BROWSER_RESTART_DELAY_MS || 5000);
 
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const AUDIO_DIR = path.join(__dirname, 'music');
@@ -81,11 +75,30 @@ let browserRestartCount = 0;  // how many times we've had to relaunch the browse
 let framesWritten = 0;
 let framesSkippedBackpressure = 0;
 let framesSkippedOverlap = 0;
+const browserRecovery = new SingleFlight({ minimumDelayMs: BROWSER_RESTART_DELAY_MS });
 
 const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function logTS(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+async function closeBrowser(instance) {
+  if (!instance) return;
+  let timer;
+  try {
+    await Promise.race([
+      instance.close(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('browser close timed out')), 5000);
+      })
+    ]);
+  } catch (err) {
+    logTS(`Graceful browser shutdown failed: ${err.message}; killing process tree`);
+    instance.process()?.kill('SIGKILL');
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Helper: Fisher–Yates shuffle
@@ -170,36 +183,56 @@ function generateXMLTV(host) {
 }
 
 async function startBrowser(reason = 'initial startup') {
+  if (browserRecovery.inFlight) {
+    logTS(`Browser recovery already in progress; coalescing request (${reason})`);
+  }
+
+  return browserRecovery.run(async () => {
   browserRestartCount++;
   logTS(`Launching browser (launch #${browserRestartCount}, reason: ${reason})`);
-  if(browser) await browser.close().catch(()=>{});
-  browser = await puppeteer.launch({
+
+  // Detach shared references before cleanup so capture ticks cannot use a page
+  // that is closing. SingleFlight guarantees there is only one cleanup/launch.
+  const oldBrowser = browser;
+  browser = null;
+  page = null;
+  await closeBrowser(oldBrowser);
+
+  let newBrowser;
+  let newPage;
+  try {
+  newBrowser = await puppeteer.launch({
     headless: "new",
     args:['--no-sandbox','--disable-setuid-sandbox','--disable-infobars','--ignore-certificate-errors','--window-size=1280,720'],
-    defaultViewport: null
+    defaultViewport: null,
+    // The application owns signal handling. Disabling Puppeteer's handlers
+    // prevents process listeners from accumulating across browser restarts.
+    handleSIGINT: false,
+    handleSIGTERM: false,
+    handleSIGHUP: false
   });
-  page = await browser.newPage();
+  newPage = await newBrowser.newPage();
   if (PERMALINK_URL) {
     console.log(`Using custom permalink URL: ${PERMALINK_URL}`);
-    await page.goto(PERMALINK_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+    await newPage.goto(PERMALINK_URL, { waitUntil: 'networkidle2', timeout: 30000 });
   } else {
-    await page.goto(WS4KP_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+    await newPage.goto(WS4KP_URL, { waitUntil: 'networkidle2', timeout: 30000 });
     try {
-      const zipInput = await page.waitForSelector('input[placeholder="Zip or City, State"], input', { timeout: 5000 });
+      const zipInput = await newPage.waitForSelector('input[placeholder="Zip or City, State"], input', { timeout: 5000 });
       if (zipInput) {
         // type the zip code
         await zipInput.type(ZIP_CODE, { delay: 100 });
         // wit for suggestions box
-        await page.waitForSelector('#divQuery .autocomplete-suggestions .suggestion');
+        await newPage.waitForSelector('#divQuery .autocomplete-suggestions .suggestion');
         // select the first suggestion
-        await page.keyboard.press('ArrowDown');
+        await newPage.keyboard.press('ArrowDown');
         // wait for the selection to be highlighted
-        await page.waitForSelector('#divQuery .autocomplete-suggestions .suggestion.selected');
+        await newPage.waitForSelector('#divQuery .autocomplete-suggestions .suggestion.selected');
         // find and press the submit button
-        const goButton = await page.$('button[type="submit"]');
+        const goButton = await newPage.$('button[type="submit"]');
         if (goButton) await goButton.click(); else await zipInput.press('Enter');
         // wait for weather content to update
-        await page.waitForSelector('div.weather-display, #weather-content', { timeout: 30000 });
+        await newPage.waitForSelector('div.weather-display, #weather-content', { timeout: 30000 });
       }
     } catch {}
 
@@ -209,14 +242,14 @@ async function startBrowser(reason = 'initial startup') {
       // get the widescreen checkbox from the settings section
 			// will throw if the element is not present on ws4kp 7.x and a different path is taken in the catch statement
 			// which is the reason for the short timeout
-      const widescreenCheckbox = await page.waitForSelector('#settings-wide-checkbox', {timeout: 100});
+      const widescreenCheckbox = await newPage.waitForSelector('#settings-wide-checkbox', {timeout: 100});
 
 
 			// 6.x (classic) behavior
 			// only supports standard and wide, check and exit with an error if not doable
 			if (VIEW_MODE === 'wide-enhanced' || VIEW_MODE === 'portrait-enhanced') {
 				console.error(`This version of ws4kp only supports VIEW_MODE 'standard' or 'enhanced'`);
-				await browser.close();
+				await newBrowser.close();
 				process.exit();
 			}
 			// get the checkbox's current state and click it to turn it on if necessary
@@ -227,7 +260,7 @@ async function startBrowser(reason = 'initial startup') {
 				try {
 				// 7.x (wide/portrait/enhanced behavior)
 				// get the selector box and select widescreen
-				const viewSelector = await page.waitForSelector('#settings-viewMode-select');
+				const viewSelector = await newPage.waitForSelector('#settings-viewMode-select');
 				// set the desired mode
 				await viewSelector.evaluate((el, VIEW_MODE) => {
 					el.value = VIEW_MODE;
@@ -239,17 +272,22 @@ async function startBrowser(reason = 'initial startup') {
 		finally {
 			// both 6.x and 7.x support kiosk as a checkbox
       // and now for kiosk
-      const kioskCheckbox = await page.waitForSelector('#settings-kiosk-checkbox');    // set the checkbox
+      const kioskCheckbox = await newPage.waitForSelector('#settings-kiosk-checkbox');    // set the checkbox
       const kioskChecked = await kioskCheckbox.evaluate((el) => el.checked);
       if (!kioskChecked) await kioskCheckbox.click();
 		}
   }
-  await page.setViewport({ ...VIEW_DIMENSIONS });
+  await newPage.setViewport({ ...VIEW_DIMENSIONS });
 
-  // Reset capture guards after a fresh browser/page is ready.
-  isCapturing = false;
+  browser = newBrowser;
+  page = newPage;
   canWrite = true;
   logTS(`Browser ready (launch #${browserRestartCount})`);
+  } catch (err) {
+    await closeBrowser(newBrowser);
+    throw err;
+  }
+  });
 }
 
 async function startTranscoding() {
@@ -278,13 +316,27 @@ async function startTranscoding() {
     .on('end',()=>{ ffmpegProc=null; ffmpegStream=null; isStreamReady=false; });
 
   captureInterval = setInterval(async ()=>{
-    if(!ffmpegProc || !ffmpegStream || !page) return;
+    if(!ffmpegProc || !ffmpegStream) return;
 
     // Don't start a new screenshot if the previous one hasn't finished yet.
     // Overlapping screenshot calls were likely a big contributor to the
     // browser hangs/restarts (and the "11 listeners" leak in the logs).
     if (isCapturing) {
       framesSkippedOverlap++;
+      return;
+    }
+
+    // A failed launch leaves no usable page. Keep recovery bounded by the
+    // same single-flight gate and retry delay instead of getting stuck.
+    if (!page) {
+      isCapturing = true;
+      try {
+        await startBrowser('page unavailable');
+      } catch (err) {
+        logTS(`Browser recovery failed: ${err.message}`);
+      } finally {
+        isCapturing = false;
+      }
       return;
     }
 
@@ -299,7 +351,7 @@ async function startTranscoding() {
 
     isCapturing = true;
     try{
-      if(page.isClosed()){ isCapturing = false; await startBrowser('page was closed'); return; }
+      if(page.isClosed()){ await startBrowser('page was closed'); return; }
       // Updated 16:9 capture for version 1.6
       const screenshot = await page.screenshot({
         type:'png',
@@ -316,11 +368,17 @@ async function startTranscoding() {
       }
     } catch(err){
       console.warn('Capture error, retrying...', err.message);
-      isCapturing = false;
-      await startBrowser(`capture error: ${err.message}`);
+      try {
+        await startBrowser(`capture error: ${err.message}`);
+      } catch (restartErr) {
+        logTS(`Browser recovery failed: ${restartErr.message}`);
+      }
       return;
+    } finally {
+      // Keep the guard set for the entire recovery. Otherwise the 100 ms
+      // interval can fan one failure out into dozens of Chromium launches.
+      isCapturing = false;
     }
-    isCapturing = false;
   },1000/FRAME_RATE);
 
   ffmpegProc.run();
@@ -330,7 +388,7 @@ async function stopTranscoding(){
   if(captureInterval) clearInterval(captureInterval);
   captureInterval=null; isStreamReady=false;
   if(ffmpegProc) ffmpegProc.kill('SIGINT'); ffmpegProc=null;
-  if(browser) await browser.close().catch(()=>{}); browser=null;
+  await closeBrowser(browser); browser=null;
 }
 
 app.get('/playlist.m3u',(req,res)=>{
@@ -368,3 +426,4 @@ app.listen(STREAM_PORT, async ()=>{
 
 process.on('SIGINT', async ()=>{ console.log('SIGINT received'); await stopTranscoding(); process.exit(); });
 process.on('SIGTERM', async ()=>{ console.log('SIGTERM received'); await stopTranscoding(); process.exit(); });
+process.on('SIGHUP', async ()=>{ console.log('SIGHUP received'); await stopTranscoding(); process.exit(); });
