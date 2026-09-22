@@ -23,6 +23,8 @@ RUN mkdir -p /app/output /app/music /app/logo && \
 
 USER node
 
+RUN npm test
+
 EXPOSE 9798
 
 ENTRYPOINT ["dumb-init", "--"]

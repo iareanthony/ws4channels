@@ -1,5 +1,18 @@
 # Latest Update
 
+Version 2.2 uses JPEG screenshots and wall-clock input timestamps. FFmpeg
+duplicates frames when capture is slower than `FRAME_RATE`, preserving live
+playback timing rather than compressing elapsed time into fewer frames.
+Output is H.264/yuv420p with closed two-second GOPs, two-second HLS segments,
+and a six-segment playlist. Playlists are not cached, segment writes are
+atomic, and epoch-based names avoid stale segment reuse after a restart.
+
+`FRAME_RATE` must be an integer from 1 to 60 (default 10). The encoder is
+software libx264; `VIDEO_OPTIONS` is not supported. GPU environment settings
+do not activate hardware encoding. Run `npm test`; the real-time regression
+test requires `ffmpeg` and `ffprobe` and deliberately feeds screenshots below
+the requested output frame rate.
+
 07/11/2026 version2.1  Added attempt to fix rare stream being more than 3 minutes behind and racing catchup.  Added better logging to troubleshoot this issue.http://<host>:9798/health
 
 05/04/2026

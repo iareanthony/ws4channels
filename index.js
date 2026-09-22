@@ -6,10 +6,11 @@ const fs = require('fs');
 const { PassThrough } = require('stream');
 const os = require('os');
 const { SingleFlight } = require('./lib/single-flight');
+const { streamOptions } = require('./lib/stream-options');
 
 const app = express();
 
-const VERSION = '2.1'; // version 2.1 - backpressure + restart logging
+const VERSION = '2.2'; // real-time capture timestamps and short HLS segments
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
 const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
@@ -17,7 +18,8 @@ const STREAM_PORT = process.env.STREAM_PORT || '9798';
 const WS4KP_URL = `http://${WS4KP_HOST}:${WS4KP_PORT}`;
 const PERMALINK_URL = process.env.PERMALINK_URL || null;
 const HLS_SETUP_DELAY = 2000;
-const FRAME_RATE = process.env.FRAME_RATE || 10;
+const FRAME_RATE = Number(process.env.FRAME_RATE || 10);
+const encoding = streamOptions(FRAME_RATE);
 const BROWSER_RESTART_DELAY_MS = Number(process.env.BROWSER_RESTART_DELAY_MS || 5000);
 
 const OUTPUT_DIR = path.join(__dirname, 'output');
@@ -58,7 +60,11 @@ const VIEW_DIMENSIONS = (()=>{
 
 [OUTPUT_DIR, AUDIO_DIR, LOGO_DIR].forEach(dir => { if (!fs.existsSync(dir)) fs.mkdirSync(dir); });
 
-app.use('/stream', express.static(OUTPUT_DIR));
+app.use('/stream', express.static(OUTPUT_DIR, {
+  setHeaders(res, filePath) {
+    if (filePath.endsWith('.m3u8')) res.setHeader('Cache-Control', 'no-store');
+  },
+}));
 app.use('/logo', express.static(LOGO_DIR));
 
 let ffmpegProc = null;
@@ -305,11 +311,11 @@ async function startTranscoding() {
   ffmpegProc = ffmpeg()
     .input(ffmpegStream)
     .inputFormat('image2pipe')
-    .inputOptions([`-framerate ${FRAME_RATE}`])
+    .inputOptions(encoding.input)
     .input(path.join(__dirname,'audio_list.txt'))
-    .inputOptions(['-f concat','-safe 0','-stream_loop -1','-vcodec png'])
+    .inputOptions(['-f concat','-safe 0','-stream_loop -1'])
     .complexFilter([`[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`,'[1:a]volume=0.5[a]'])
-    .outputOptions(['-map [v]','-map [a]','-c:v libx264','-c:a aac','-b:a 128k','-preset ultrafast','-b:v 1000k','-f hls','-hls_time 2','-hls_list_size 2','-hls_flags delete_segments'])
+    .outputOptions(encoding.output)
     .output(HLS_FILE)
     .on('start',()=>{ logTS(`Started FFmpeg - Version ${VERSION}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
     .on('error', async err=>{ logTS(`FFmpeg error: ${err.message}`); await stopTranscoding(); startTranscoding(); })
@@ -354,7 +360,9 @@ async function startTranscoding() {
       if(page.isClosed()){ await startBrowser('page was closed'); return; }
       // Updated 16:9 capture for version 1.6
       const screenshot = await page.screenshot({
-        type:'png',
+        type:'jpeg',
+        quality: 85,
+        optimizeForSpeed: true,
         clip:{ x:0, y:0, ...VIEW_DIMENSIONS } // crop top, right, and bottom based on your measurements
       });
       const ok = ffmpegStream.write(screenshot);
