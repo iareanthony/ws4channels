@@ -1,5 +1,31 @@
 # Latest Update
 
+Version 2.3 bounds Chromium's lifetime to reclaim browser/rendering memory.
+`BROWSER_RECYCLE_INTERVAL_MS` defaults to `21600000` (six hours); set `0` to
+disable, or an integer of at least `10000` for testing. The interval starts
+when the browser becomes ready. Cleanup closes the old browser before opening
+another, using the same single-flight gate as error recovery.
+
+During cleanup, the last JPEG is repeated with backpressure protection while
+FFmpeg and audio keep running. The weather picture briefly freezes while the
+page reloads. This is a memory-growth mitigation, not proof that the underlying
+leak is fixed. `/health` includes browser age, recovery state, fallback frame
+count, last fresh capture time, Node memory and cgroup v2 container memory.
+Container memory includes reclaimable cache. Health becomes unsuccessful if
+fresh captures stop for two minutes. Memory is also logged before each browser
+launch and in capture health summaries.
+
+Validate with `npm test` and an isolated container using a short recycle
+interval (`15000`), then run:
+
+```bash
+RECYCLE_TEST_URL=http://127.0.0.1:19798 node --test test/browser-recycle.integration.test.js
+```
+
+Use the isolated container's mapped port in the URL. Confirm browser PIDs change, FFmpeg's PID stays constant, HLS sequence
+numbers keep advancing during recovery, fresh captures resume, and memory
+falls after recycling. Production needs a multi-day observation window.
+
 Version 2.2 uses JPEG screenshots and wall-clock input timestamps. FFmpeg
 duplicates frames when capture is slower than `FRAME_RATE`, preserving live
 playback timing rather than compressing elapsed time into fewer frames.

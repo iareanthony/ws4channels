@@ -7,10 +7,11 @@ const { PassThrough } = require('stream');
 const os = require('os');
 const { SingleFlight } = require('./lib/single-flight');
 const { streamOptions } = require('./lib/stream-options');
+const { BrowserMaintenance, memoryUsage } = require('./lib/browser-maintenance');
 
 const app = express();
 
-const VERSION = '2.2'; // real-time capture timestamps and short HLS segments
+const VERSION = '2.3'; // bounded browser lifetime with continuous fallback frames
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
 const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
@@ -72,6 +73,11 @@ let ffmpegStream = null;
 let browser = null;
 let page = null;
 let captureInterval = null;
+let stopping = false;
+let lastScreenshot = null;
+let lastCaptureAt = 0;
+let fallbackFrames = 0;
+const maintenance = new BrowserMaintenance(process.env.BROWSER_RECYCLE_INTERVAL_MS);
 let isStreamReady = false;
 
 // --- New state for backpressure + overlap protection + restart diagnostics ---
@@ -83,7 +89,18 @@ let framesSkippedBackpressure = 0;
 let framesSkippedOverlap = 0;
 const browserRecovery = new SingleFlight({ minimumDelayMs: BROWSER_RESTART_DELAY_MS });
 
-const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
+function requestBrowserRecovery(reason) {
+  if (stopping || browserRecovery.inFlight) return;
+  // Do not await here: capture ticks repeat the last frame while Chromium
+  // closes and reloads, keeping FFmpeg's video and audio inputs moving.
+  void startBrowser(reason).catch(err => logTS(`Browser recovery failed: ${err.message}`));
+}
+
+function writeFrame(frame) {
+  if (!frame || !ffmpegStream || !canWrite) return;
+  canWrite = ffmpegStream.write(frame);
+  framesWritten++;
+}
 
 function logTS(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -194,7 +211,9 @@ async function startBrowser(reason = 'initial startup') {
   }
 
   return browserRecovery.run(async () => {
+  if (stopping) return;
   browserRestartCount++;
+  logTS(`Browser memory before cleanup: ${JSON.stringify(memoryUsage())}`);
   logTS(`Launching browser (launch #${browserRestartCount}, reason: ${reason})`);
 
   // Detach shared references before cleanup so capture ticks cannot use a page
@@ -203,6 +222,7 @@ async function startBrowser(reason = 'initial startup') {
   browser = null;
   page = null;
   await closeBrowser(oldBrowser);
+  if (stopping) return;
 
   let newBrowser;
   let newPage;
@@ -287,7 +307,7 @@ async function startBrowser(reason = 'initial startup') {
 
   browser = newBrowser;
   page = newPage;
-  canWrite = true;
+  maintenance.markReady();
   logTS(`Browser ready (launch #${browserRestartCount})`);
   } catch (err) {
     await closeBrowser(newBrowser);
@@ -297,6 +317,10 @@ async function startBrowser(reason = 'initial startup') {
 }
 
 async function startTranscoding() {
+  stopping = false;
+  lastScreenshot = null;
+  lastCaptureAt = 0;
+  canWrite = true;
   await startBrowser('initial startup');
   createAudioInputFile();
 
@@ -318,11 +342,11 @@ async function startTranscoding() {
     .outputOptions(encoding.output)
     .output(HLS_FILE)
     .on('start',()=>{ logTS(`Started FFmpeg - Version ${VERSION}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
-    .on('error', async err=>{ logTS(`FFmpeg error: ${err.message}`); await stopTranscoding(); startTranscoding(); })
+    .on('error', async err=>{ if (stopping) return; logTS(`FFmpeg error: ${err.message}`); await stopTranscoding(); startTranscoding(); })
     .on('end',()=>{ ffmpegProc=null; ffmpegStream=null; isStreamReady=false; });
 
   captureInterval = setInterval(async ()=>{
-    if(!ffmpegProc || !ffmpegStream) return;
+    if(stopping || !ffmpegProc || !ffmpegStream) return;
 
     // Don't start a new screenshot if the previous one hasn't finished yet.
     // Overlapping screenshot calls were likely a big contributor to the
@@ -332,16 +356,13 @@ async function startTranscoding() {
       return;
     }
 
-    // A failed launch leaves no usable page. Keep recovery bounded by the
-    // same single-flight gate and retry delay instead of getting stuck.
-    if (!page) {
-      isCapturing = true;
-      try {
-        await startBrowser('page unavailable');
-      } catch (err) {
-        logTS(`Browser recovery failed: ${err.message}`);
-      } finally {
-        isCapturing = false;
+    if (!browserRecovery.inFlight && (!page || maintenance.due())) {
+      requestBrowserRecovery(page ? 'scheduled memory cleanup' : 'page unavailable');
+    }
+    if (browserRecovery.inFlight || !page) {
+      if (lastScreenshot && canWrite) {
+        writeFrame(lastScreenshot);
+        fallbackFrames++;
       }
       return;
     }
@@ -357,7 +378,7 @@ async function startTranscoding() {
 
     isCapturing = true;
     try{
-      if(page.isClosed()){ await startBrowser('page was closed'); return; }
+      if(page.isClosed()){ requestBrowserRecovery('page was closed'); return; }
       // Updated 16:9 capture for version 1.6
       const screenshot = await page.screenshot({
         type:'jpeg',
@@ -365,26 +386,21 @@ async function startTranscoding() {
         optimizeForSpeed: true,
         clip:{ x:0, y:0, ...VIEW_DIMENSIONS } // crop top, right, and bottom based on your measurements
       });
-      const ok = ffmpegStream.write(screenshot);
-      framesWritten++;
-      if (!ok) canWrite = false; // wait for 'drain' before writing again
+      lastScreenshot = screenshot;
+      lastCaptureAt = Date.now();
+      writeFrame(screenshot);
 
       // Every 5 minutes, log a quick health summary. Useful for confirming
       // whether backpressure/overlap skips are happening in practice.
       if (framesWritten % (FRAME_RATE * 60 * 5) === 0) {
-        logTS(`Health check: framesWritten=${framesWritten}, skippedBackpressure=${framesSkippedBackpressure}, skippedOverlap=${framesSkippedOverlap}, browserRestarts=${browserRestartCount}`);
+        logTS(`Health check: framesWritten=${framesWritten}, skippedBackpressure=${framesSkippedBackpressure}, skippedOverlap=${framesSkippedOverlap}, browserRestarts=${browserRestartCount}, memory=${JSON.stringify(memoryUsage())}`);
       }
     } catch(err){
       console.warn('Capture error, retrying...', err.message);
-      try {
-        await startBrowser(`capture error: ${err.message}`);
-      } catch (restartErr) {
-        logTS(`Browser recovery failed: ${restartErr.message}`);
-      }
+      requestBrowserRecovery(`capture error: ${err.message}`);
       return;
     } finally {
-      // Keep the guard set for the entire recovery. Otherwise the 100 ms
-      // interval can fan one failure out into dozens of Chromium launches.
+      // Browser recovery has its own single-flight gate.
       isCapturing = false;
     }
   },1000/FRAME_RATE);
@@ -393,10 +409,13 @@ async function startTranscoding() {
 }
 
 async function stopTranscoding(){
+  stopping = true;
   if(captureInterval) clearInterval(captureInterval);
   captureInterval=null; isStreamReady=false;
   if(ffmpegProc) ffmpegProc.kill('SIGINT'); ffmpegProc=null;
-  await closeBrowser(browser); browser=null;
+  await browserRecovery.inFlight?.catch(() => {});
+  await closeBrowser(browser); browser=null; page=null;
+  lastScreenshot=null;
 }
 
 app.get('/playlist.m3u',(req,res)=>{
@@ -415,8 +434,15 @@ app.get('/guide.xml',(req,res)=>{
 });
 
 app.get('/health',(req,res)=>{
-  res.status(isStreamReady?200:503).json({
-    ready:isStreamReady,
+  const ready = isStreamReady && lastCaptureAt > 0 && Date.now() - lastCaptureAt < 120000;
+  res.status(ready?200:503).json({
+    ready,
+    version: VERSION,
+    browserAgeSeconds: maintenance.ageSeconds(),
+    browserRecovering: Boolean(browserRecovery.inFlight),
+    lastCaptureAt: lastCaptureAt ? new Date(lastCaptureAt).toISOString() : null,
+    fallbackFrames,
+    memory: memoryUsage(),
     browserRestarts: browserRestartCount,
     framesWritten,
     framesSkippedBackpressure,
