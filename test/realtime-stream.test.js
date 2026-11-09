@@ -15,7 +15,7 @@ test('slow capture keeps real-time duration, two-second segments and compatible 
   assert.equal(frame.status, 0);
   const opts = streamOptions(10);
   const output = opts.output.filter(x => !x.startsWith('-map ')).flatMap(x => x.split(' '));
-  const proc = spawn('ffmpeg', ['-v', 'error', '-f', 'image2pipe', ...opts.input.flatMap(x => x.split(' ')), '-i', 'pipe:0', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000', '-shortest', ...output, path.join(dir, 'stream.m3u8')]);
+  const proc = spawn('ffmpeg', ['-v', 'error', '-f', 'image2pipe', ...opts.input.flatMap(x => x.split(' ')), '-i', 'pipe:0', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000', '-shortest', '-vf', opts.pixelFilter, ...output, path.join(dir, 'stream.m3u8')]);
   let errors = '';
   proc.stderr.on('data', x => { errors += x; });
   const exited = once(proc, 'exit');

@@ -338,7 +338,7 @@ async function startTranscoding() {
     .inputOptions(encoding.input)
     .input(path.join(__dirname,'audio_list.txt'))
     .inputOptions(['-f concat','-safe 0','-stream_loop -1'])
-    .complexFilter([`[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`,'[1:a]volume=0.5[a]'])
+    .complexFilter([`[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}:in_range=pc:out_range=tv,format=yuv420p[v]`,'[1:a]volume=0.5[a]'])
     .outputOptions(encoding.output)
     .output(HLS_FILE)
     .on('start',()=>{ logTS(`Started FFmpeg - Version ${VERSION}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
