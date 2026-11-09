@@ -206,4 +206,7 @@ About:
 
 A nostalgic weather streaming solution for Channels DVR, built with Node.js, Puppeteer, and FFmpeg.
 
+The container rebuilds without cache from Node.js 24 on Debian Trixie, applies
+current OS security updates, and uses pinned current runtime dependencies.
+
 [Buy me a coffee ☕](https://www.buymeacoffee.com/rice9797)

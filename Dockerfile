@@ -1,9 +1,10 @@
-FROM node:24-bookworm-slim
+FROM node:24-trixie-slim
 
 ENV NODE_ENV=production \
     PUPPETEER_SKIP_DOWNLOAD=true
 
 RUN apt-get update && \
+    apt-get full-upgrade -y && \
     apt-get install -y --no-install-recommends \
       chromium \
       ffmpeg \
